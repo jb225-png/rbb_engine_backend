@@ -1,5 +1,6 @@
 from pptx import Presentation
 from pptx.util import Pt
+from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.oxml.ns import qn
 from lxml import etree
 from pathlib import Path
@@ -17,6 +18,10 @@ class PPTXProcessor:
     def __init__(self):
         templates_dir = os.getenv('TEMPLATES_DIR', Path(__file__).parent.parent.parent / 'Templates')
         self.templates_dir = Path(templates_dir)
+        # Per-product record of every fit cut made while filling boxes.
+        # Reset by process_template() before each product; _save() writes it
+        # out as a pptx_quality_report JSON next to the product files.
+        self.truncation_log: list = []
 
     def _template_path(self, filename: str) -> Path:
         return self.templates_dir / filename
@@ -28,6 +33,8 @@ class PPTXProcessor:
         return int((width_inches * 72) / (font_pt * 0.52))
 
     def _truncate_to_box(self, text: str, width_in: float, height_in: float, font_pt: int) -> str:
+        """LEGACY hard truncation — kept for reference only. Cuts mid-word and
+        mid-sentence with no record. _fill_shape now uses _fit_to_box."""
         max_lines = self._lines_that_fit(height_in, font_pt)
         cpl = self._chars_per_line(width_in, font_pt)
         result = []
@@ -44,6 +51,83 @@ class PPTXProcessor:
                 result.append(line)
                 total += wrapped
         return '\n'.join(result)
+
+    def _fit_line_to_budget(self, line: str, budget: int) -> str:
+        """Fit one line into a character budget without cutting mid-word or
+        mid-sentence. Prefers the last complete sentence that fits; falls
+        back to a word-boundary cut marked with '…'. Returns '' if nothing
+        meaningful fits."""
+        if budget <= 0:
+            return ""
+        if len(line) <= budget:
+            return line
+        window = line[:budget]
+        # Last sentence-ending punctuation followed by a space or end of window
+        best = -1
+        for i, ch in enumerate(window):
+            if ch in '.!?' and (i + 1 == len(window) or window[i + 1] == ' '):
+                best = i
+        # Use the sentence cut unless it would waste most of the budget
+        # (guards against false boundaries like "Mr." early in a line)
+        if best >= max(20, budget // 4):
+            return window[:best + 1]
+        space = window.rfind(' ')
+        if space > 0:
+            return window[:space].rstrip(' ,;:') + '…'
+        return window + '…'
+
+    def _fit_to_box(self, text: str, width_in: float, height_in: float, font_pt: int, token: str = "") -> str:
+        """Fit text into a slide text box. Unlike the legacy _truncate_to_box,
+        this never cuts mid-word or mid-sentence, and every cut is recorded
+        in self.truncation_log (and written to the product's quality report
+        on save) instead of happening silently."""
+        max_lines = self._lines_that_fit(height_in, font_pt)
+        cpl = self._chars_per_line(width_in, font_pt)
+        if max_lines <= 0 or cpl <= 0:
+            return text
+
+        lines = text.split('\n')
+
+        def wrapped_count(s: str) -> int:
+            return max(1, (len(s) + cpl - 1) // cpl)
+
+        if sum(wrapped_count(l) for l in lines) <= max_lines:
+            return text
+
+        result = []
+        used = 0
+        cut_chars = 0
+        for idx, line in enumerate(lines):
+            w = wrapped_count(line)
+            if used + w <= max_lines:
+                result.append(line)
+                used += w
+                continue
+            remaining_lines = max_lines - used
+            if remaining_lines > 0:
+                fitted = self._fit_line_to_budget(line, remaining_lines * cpl)
+                if fitted:
+                    result.append(fitted)
+                cut_chars += len(line) - len(fitted)
+            else:
+                cut_chars += len(line)
+            # Everything after the overflowing line is cut as well
+            cut_chars += sum(len(l) + 1 for l in lines[idx + 1:])
+            break
+
+        fitted_text = '\n'.join(result)
+        if cut_chars > 0:
+            self.truncation_log.append({
+                "token": token,
+                "chars_cut": cut_chars,
+                "original_chars": len(text),
+                "kept_chars": len(fitted_text),
+            })
+            logger.warning(
+                f"PPTX fit: cut {cut_chars} chars from {token or 'text box'} "
+                f"(kept {len(fitted_text)}/{len(text)} chars) — recorded in quality report"
+            )
+        return fitted_text
 
     def _merge_paragraph_runs(self, para):
         runs = para.runs
@@ -91,6 +175,13 @@ class PPTXProcessor:
             return False
         tf = shape.text_frame
         tf.word_wrap = True
+        # Safety net: let PowerPoint shrink text to fit the shape on render
+        # rather than overflowing the box (our pre-fit in _fit_to_box is the
+        # primary control; this catches estimation error in line counts).
+        try:
+            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        except Exception:
+            pass
         for para in tf.paragraphs:
             self._merge_paragraph_runs(para)
         if token not in tf.text:
@@ -105,8 +196,8 @@ class PPTXProcessor:
                 break
         w_in = shape.width  / 914400
         h_in = shape.height / 914400
-        truncated = self._truncate_to_box(value, w_in, h_in, font_pt)
-        self._set_paragraphs(tf, truncated, font_pt, template_run_xml, bold)
+        fitted = self._fit_to_box(value, w_in, h_in, font_pt, token)
+        self._set_paragraphs(tf, fitted, font_pt, template_run_xml, bold)
         return True
 
     def _fill_slides(self, prs: Presentation, token_map: Dict[str, tuple]):
@@ -136,6 +227,19 @@ class PPTXProcessor:
         output_path = product_path / filename
         prs.save(str(output_path))
         logger.info(f"Saved -> {output_path}")
+        if self.truncation_log:
+            try:
+                storage_manager.save_json_file(product_id, "pptx_quality_report", {
+                    "product_id": product_id,
+                    "file": filename,
+                    "cuts": self.truncation_log,
+                })
+                logger.warning(
+                    f"Product {product_id}: {len(self.truncation_log)} box(es) needed fit cuts — "
+                    f"see pptx_quality_report.json"
+                )
+            except Exception as e:
+                logger.warning(f"Could not save PPTX quality report for product {product_id}: {e}")
         return output_path
 
     def _grade_suffix(self, grade) -> str:
@@ -687,6 +791,7 @@ class PPTXProcessor:
     #  DISPATCHER                                                          #
     # ------------------------------------------------------------------ #
     def process_template(self, template_type: str, content_data: Dict[str, Any], product_metadata: Dict[str, Any], product_id: int) -> Path:
+        self.truncation_log = []
         dispatch = {
             'ANCHOR_READING_PASSAGE':          self.fill_anchor_reading_passage,
             'BUNDLE_OVERVIEW':                 self.fill_bundle_overview,
