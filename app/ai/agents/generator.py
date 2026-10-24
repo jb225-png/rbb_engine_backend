@@ -1,6 +1,7 @@
 import json
 from typing import Dict, Any
 from app.ai.claude_client import claude_client
+from app.ai.json_parsing import parse_claude_json
 from app.ai.prompts.base import BASE_SYSTEM_PROMPT, get_generation_prompt
 from app.ai.prompts.worksheet import WORKSHEET_SYSTEM_PROMPT, WORKSHEET_GENERATION_PROMPT
 from app.ai.schemas.worksheet import WorksheetSchema
@@ -26,21 +27,8 @@ class GeneratorAgent:
         }
     
     def _parse_json_response(self, raw_output: str) -> Dict[str, Any]:
-        """Parse Claude JSON response with markdown cleanup"""
-        cleaned = raw_output.strip()
-        if cleaned.startswith('```json'):
-            cleaned = cleaned[7:]
-        if cleaned.startswith('```'):
-            cleaned = cleaned[3:]
-        if cleaned.endswith('```'):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
-        
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON from Claude: {e}")
-            raise ValueError("Generated content is not valid JSON")
+        """Parse Claude JSON response (fence/prose tolerant; see app.ai.json_parsing)"""
+        return parse_claude_json(raw_output)
     
     async def generate_content(
         self, 
@@ -71,23 +59,12 @@ class GeneratorAgent:
             raw_output = await claude_client.generate(system_prompt, user_prompt)
             logger.info(f"Claude raw output for product {product_id}: {raw_output[:200]}...")
             
-            # Clean up Claude response (remove markdown code blocks)
-            cleaned_output = raw_output.strip()
-            if cleaned_output.startswith('```json'):
-                cleaned_output = cleaned_output[7:]  # Remove ```json
-            if cleaned_output.startswith('```'):
-                cleaned_output = cleaned_output[3:]   # Remove ```
-            if cleaned_output.endswith('```'):
-                cleaned_output = cleaned_output[:-3]  # Remove trailing ```
-            cleaned_output = cleaned_output.strip()
-            
-            # Parse JSON response
+            # Parse JSON response (shared fence/prose-tolerant parser)
             try:
-                content_data = json.loads(cleaned_output)
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON from Claude for product {product_id}: {e}")
-                logger.error(f"Cleaned Claude output: {cleaned_output}")
-                raise ValueError("Generated content is not valid JSON")
+                content_data = self._parse_json_response(raw_output)
+            except ValueError:
+                logger.error(f"Unparseable Claude output for product {product_id} — raw response logged by parser")
+                raise
             
             # Skip schema validation - Claude generates good content but with different field names
             # Content is saved successfully to storage regardless of schema validation

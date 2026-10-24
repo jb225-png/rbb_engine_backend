@@ -1,6 +1,7 @@
 import json
 from typing import Dict, Any
 from app.ai.claude_client import claude_client
+from app.ai.json_parsing import parse_claude_json
 from app.ai.prompts.base import get_qc_prompt
 from app.ai.schemas.qc import QCSchema
 from app.utils.storage import storage_manager
@@ -34,21 +35,8 @@ VERDICT GUIDELINES:
 OUTPUT: Valid JSON only, following QC schema exactly."""
     
     def _parse_json_response(self, raw_output: str) -> Dict[str, Any]:
-        """Parse Claude JSON response with markdown cleanup"""
-        cleaned = raw_output.strip()
-        if cleaned.startswith('```json'):
-            cleaned = cleaned[7:]
-        if cleaned.startswith('```'):
-            cleaned = cleaned[3:]
-        if cleaned.endswith('```'):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
-        
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON from Claude: {e}")
-            raise ValueError("Generated content is not valid JSON")
+        """Parse Claude JSON response (fence/prose tolerant; see app.ai.json_parsing)"""
+        return parse_claude_json(raw_output)
     
     async def evaluate_content(
         self,
