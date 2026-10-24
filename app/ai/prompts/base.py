@@ -37,6 +37,12 @@ REQUIREMENTS:
 - Provide engaging, practical content
 - Follow {curriculum} guidelines
 
+LENGTH LIMITS (output is placed into fixed-size slide text boxes — anything over the limit is lost):
+- Reading passages: 350-500 words, always ending with a complete sentence
+- Any single text field: under 2,700 characters unless the schema states a different limit
+- Each question, including its answer options: under 400 characters
+- Never end a section mid-sentence. If content must be shortened, drop the least important complete sentence instead of trailing off
+
 Generate the complete {product_type.lower()} as valid JSON following the required schema."""
 
 def get_qc_prompt(product_type: str, content: str, standard: str, grade_level: int) -> str:
